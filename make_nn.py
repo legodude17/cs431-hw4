@@ -1,59 +1,88 @@
 import os
 import sys
-from functools import partial
 os.environ["KERAS_BACKEND"] = "tensorflow"
 
+import tensorflow as tf
 import keras
 from keras import layers
 
-EPOCHS = 1
+EPOCHS = 25
 DIR = sys.argv[1]
 FILE = sys.argv[2]
 
-labels = []
+augment_layers = [
+  layers.RandomFlip("horizontal"),
+  layers.RandomRotation(0.1),
+  layers.Rescaling(1./255)
+]
 
-for root, dirs, files in os.walk(DIR):
-    for file in files:
-        if file[0] == "c":
-          labels.append(0)
-        if file[0] == "d":
-           labels.append(1)
+@tf.function
+def process_path(x):
+  file = tf.io.read_file(x)
+  label = tf.strings.split(x, os.sep)[-1]
+  label = tf.strings.substr(label, 0, 1)
+  if tf.math.equal(label, "c"):
+    label = 0.
+  elif tf.math.equal(label, "d"):
+    label = 1.
+  else:
+    label = -1.
+  image = tf.io.decode_image(file, channels=3, expand_animations=False)
+  return image, label
 
-dataset = keras.utils.image_dataset_from_directory(
-    DIR,
-    labels=labels,
-    label_mode="binary",
-    color_mode="rgb",
-    batch_size= 32,
-    image_size=(100, 100),
-    shuffle=True,
-    verbose=True
+def augment_data(images):
+  for layer in augment_layers:
+    images = layer(images, training=True)
+  return images
+
+dataset = tf.data.Dataset.list_files(DIR + "/*.jpg")
+dataset = dataset.shuffle(dataset.cardinality()).map(
+  process_path, num_parallel_calls=tf.data.AUTOTUNE
 )
+dataset = dataset.map(
+  lambda x, y: (augment_data(x), y), num_parallel_calls=tf.data.AUTOTUNE
+)
+dataset = dataset.batch(128).prefetch(tf.data.AUTOTUNE)
 
-DefaultConv2D = partial(layers.Conv2D, padding = "same", activation = "relu")
+inputs = keras.Input((100, 100, 3))
 
-model = keras.Sequential([
-   layers.Input((100, 100, 3)),
-   DefaultConv2D(16, (7, 7)),
-   layers.MaxPooling2D(),
-   DefaultConv2D(32, (3, 3)),
-   DefaultConv2D(32, (3, 3)),
-   layers.MaxPooling2D(),
-   DefaultConv2D(64, (3, 3)),
-   DefaultConv2D(64, (3, 3)),
-   layers.MaxPooling2D(),
-   layers.Flatten(),
-   layers.Dense(64, activation="relu"),
-   layers.Dropout(0.5),
-   layers.Dense(16, activation="relu"),
-   layers.Dropout(0.5),
-   layers.Dense(1, activation="relu")
-])
+x = layers.Conv2D(128, 3, strides=2, padding="same")(inputs)
+x = layers.BatchNormalization()(x)
+x = layers.Activation("relu")(x)
+
+prev_act = x
+
+for size in [256, 512, 728]:
+  x = layers.Activation("relu")(x)
+  x = layers.SeparableConv2D(size, 3, padding="same")(x)
+  x = layers.BatchNormalization()(x)
+
+  x = layers.Activation("relu")(x)
+  x = layers.SeparableConv2D(size, 3, padding="same")(x)
+  x = layers.BatchNormalization()(x)
+
+  x = layers.MaxPooling2D(3, strides=2, padding="same")(x)
+
+  residual = layers.Conv2D(size, 1, strides=2, padding="same")(prev_act)
+  x = layers.add([x, residual])
+  prev_act = x
+
+x = layers.SeparableConv2D(1024, 3, padding="same")(x)
+x = layers.BatchNormalization()(x)
+x = layers.Activation("relu")(x)
+
+x = layers.GlobalAveragePooling2D()(x)
+
+x = layers.Dropout(0.25)(x)
+
+outputs = layers.Dense(1, activation=None)(x)
+
+model = keras.Model(inputs, outputs)
 
 model.compile(
-  optimizer="adam",
-  loss=keras.losses.BinaryCrossentropy(),
-  metrics=["accuracy"],
+  optimizer=keras.optimizers.Adam(3e-4),
+  loss=keras.losses.BinaryCrossentropy(from_logits=True),
+  metrics=[keras.metrics.BinaryAccuracy(name="acc")],
 )
 
 model.summary()

@@ -1,4 +1,6 @@
 __pycache__
 cats-and-dogs
+cats-and-dogs-new
 *.keras
 .DS_Store
+*.h5
